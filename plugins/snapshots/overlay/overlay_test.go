@@ -23,8 +23,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/core/mount"
@@ -34,6 +36,7 @@ import (
 	"github.com/containerd/containerd/v2/internal/userns"
 	"github.com/containerd/containerd/v2/pkg/testutil"
 	"github.com/containerd/containerd/v2/plugins/snapshots/overlay/overlayutils"
+	"github.com/containerd/continuity/fs"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -68,6 +71,209 @@ func TestOverlayConfiguredIndexNotOverridden(t *testing.T) {
 		if opt == "index=off" {
 			t.Fatalf("configured index option overridden by auto-appended index=off (options: %v)", options)
 		}
+	}
+}
+
+func directoryAtime(t *testing.T, path string) time.Time {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat := info.Sys().(*syscall.Stat_t)
+	return time.Unix(stat.Atim.Sec, stat.Atim.Nsec)
+}
+
+func TestOverlayCommitPreservesDirectoryAtime(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	sn, err := NewSnapshotter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sn.Close()
+
+	// Only assert the atime behavior on backing filesystems where reading a
+	// directory updates it. A noatime mount cannot reproduce the regression.
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	probe := filepath.Join(root, "atime-probe")
+	if err := os.Mkdir(probe, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(probe, old, old); err != nil {
+		t.Fatal(err)
+	}
+	probeAtime := directoryAtime(t, probe)
+	if _, err := os.ReadDir(probe); err != nil {
+		t.Fatal(err)
+	}
+	if directoryAtime(t, probe).Equal(probeAtime) {
+		t.Skip("backing filesystem does not update directory atime")
+	}
+
+	mounts, err := sn.Prepare(ctx, "active", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(mounts[0].Source, "testdir")
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(file, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{dir, file} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantAtime := map[string]time.Time{
+		dir:  directoryAtime(t, dir),
+		file: directoryAtime(t, file),
+	}
+	if err := sn.Commit(ctx, "committed", "active"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{dir, file} {
+		if got := directoryAtime(t, path); !got.Equal(wantAtime[path]) {
+			t.Errorf("Commit changed atime of %s: got %s, want %s", path, got, wantAtime[path])
+		}
+	}
+}
+
+func TestOverlayCommitWithSymlinkUpper(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	sn, err := NewSnapshotter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sn.Close()
+	mounts, err := sn.Prepare(ctx, "active", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper := mounts[0].Source
+	content := filepath.Join(root, "content")
+	if err := os.Rename(upper, content); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(content, upper); err != nil {
+		t.Fatal(err)
+	}
+	want, err := fs.DiskUsage(ctx, upper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sn.Commit(ctx, "committed", "active"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := sn.Usage(ctx, "committed"); err != nil || got != snapshots.Usage(want) {
+		t.Fatalf("committed usage = %+v, %v; want %+v", got, err, want)
+	}
+}
+
+func TestOverlayDeferredUsage(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	sn, err := NewSnapshotter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mounts, err := sn.Prepare(ctx, "active", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(mounts[0].Source, "file.txt")
+	if err := os.WriteFile(file, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	expected, err := fs.DiskUsage(ctx, mounts[0].Source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := sn.Usage(ctx, "active"); err != nil || got != snapshots.Usage(expected) {
+		t.Fatalf("active usage = %+v, %v; want %+v", got, err, expected)
+	}
+	if err := sn.Commit(ctx, "committed", "active"); err != nil {
+		t.Fatal(err)
+	}
+
+	checkRecorded := func(want bool) {
+		t.Helper()
+		if err := sn.(*snapshotter).ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+			_, _, _, recorded, err := storage.GetInfoWithUsage(ctx, "committed")
+			if err == nil && recorded != want {
+				t.Errorf("usage recorded = %t, want %t", recorded, want)
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkRecorded(false)
+
+	// A failed calculation must leave the snapshot available for retry.
+	missing := mounts[0].Source + ".missing"
+	if err := os.Rename(mounts[0].Source, missing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sn.Usage(ctx, "committed"); err == nil {
+		t.Fatal("expected usage calculation to fail with a missing upper directory")
+	}
+	checkRecorded(false)
+	if err := os.Rename(missing, mounts[0].Source); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	errors := make(chan error, 8)
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, err := sn.Usage(ctx, "committed")
+			if err == nil && got != snapshots.Usage(expected) {
+				err = fmt.Errorf("committed usage = %+v, want %+v", got, expected)
+			}
+			errors <- err
+		}()
+	}
+	wg.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkRecorded(true)
+	if err := os.Rename(mounts[0].Source, missing); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := sn.Usage(ctx, "committed"); err != nil || got != snapshots.Usage(expected) {
+		t.Fatalf("cached usage = %+v, %v; want %+v", got, err, expected)
+	}
+	if err := os.Rename(missing, mounts[0].Source); err != nil {
+		t.Fatal(err)
+	}
+	if err := sn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sn, err = NewSnapshotter(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sn.Close()
+	if err := os.Rename(mounts[0].Source, missing); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := sn.Usage(ctx, "committed"); err != nil || got != snapshots.Usage(expected) {
+		t.Fatalf("usage after reopening = %+v, %v; want %+v", got, err, expected)
+	}
+	if err := os.Rename(missing, mounts[0].Source); err != nil {
+		t.Fatal(err)
 	}
 }
 

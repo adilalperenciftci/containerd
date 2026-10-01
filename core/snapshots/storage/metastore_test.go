@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +36,150 @@ type testFunc func(context.Context, *testing.T, *MetaStore)
 type metaFactory func(string) (*MetaStore, error)
 
 type populateFunc func(context.Context, *MetaStore) error
+
+func TestDeferredUsageStorage(t *testing.T) {
+	ctx := context.Background()
+	dbfile := filepath.Join(t.TempDir(), "metadata.db")
+	ms, err := NewMetaStore(dbfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var id string
+	if err := ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if _, err := CreateSnapshot(ctx, snapshots.KindActive, "active", ""); err != nil {
+			return err
+		}
+		id, err = CommitActiveWithoutUsage(ctx, "active", "committed")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	checkUsage := func(recorded bool, want snapshots.Usage) {
+		t.Helper()
+		if err := ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+			_, info, usage, hasUsage, err := GetInfoWithUsage(ctx, "committed")
+			if err == nil && (info.Kind != snapshots.KindCommitted || hasUsage != recorded || usage != want) {
+				t.Errorf("committed info = %+v, usage = %+v, recorded = %t; want usage %+v, recorded %t", info, usage, hasUsage, want, recorded)
+			}
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkUsage(false, snapshots.Usage{})
+	if err := ms.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ms, err = NewMetaStore(dbfile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ms.Close()
+	checkUsage(false, snapshots.Usage{})
+
+	want := snapshots.Usage{Inodes: 2, Size: 4096}
+	if err := ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		stored, err := SetUsageIfAbsent(ctx, "committed", id, want)
+		if stored != want {
+			t.Errorf("stored usage = %+v, want %+v", stored, want)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checkUsage(true, want)
+	if err := ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		stored, err := SetUsageIfAbsent(ctx, "committed", id, snapshots.Usage{Inodes: 9})
+		if stored != want {
+			t.Errorf("second calculation replaced usage: got %+v, want %+v", stored, want)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if _, _, err := Remove(ctx, "committed"); err != nil {
+			return err
+		}
+		if _, err := CreateSnapshot(ctx, snapshots.KindActive, "next", ""); err != nil {
+			return err
+		}
+		_, err := CommitActiveWithoutUsage(ctx, "next", "committed")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		_, err := SetUsageIfAbsent(ctx, "committed", id, want)
+		if !errdefs.IsFailedPrecondition(err) {
+			t.Errorf("usage write for replaced snapshot: got %v, want failed precondition", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checkUsage(false, snapshots.Usage{})
+	if err := ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if _, err := CreateSnapshot(ctx, snapshots.KindActive, "zero-active", ""); err != nil {
+			return err
+		}
+		_, err := CommitActive(ctx, "zero-active", "zero-committed", snapshots.Usage{})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.WithTransaction(ctx, false, func(ctx context.Context) error {
+		_, _, usage, recorded, err := GetInfoWithUsage(ctx, "zero-committed")
+		if err == nil && (!recorded || usage != (snapshots.Usage{})) {
+			t.Errorf("recorded zero usage = %+v, recorded = %t", usage, recorded)
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+		if _, err := CreateSnapshot(ctx, snapshots.KindActive, "concurrent-active", ""); err != nil {
+			return err
+		}
+		id, err = CommitActiveWithoutUsage(ctx, "concurrent-active", "concurrent")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		usage snapshots.Usage
+		err   error
+	}
+	results := make(chan result, 8)
+	var wg sync.WaitGroup
+	for i := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var stored snapshots.Usage
+			err := ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+				var err error
+				stored, err = SetUsageIfAbsent(ctx, "concurrent", id, snapshots.Usage{Inodes: int64(i + 1)})
+				return err
+			})
+			results <- result{stored, err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var first snapshots.Usage
+	for r := range results {
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		if first == (snapshots.Usage{}) {
+			first = r.usage
+		} else if r.usage != first {
+			t.Errorf("concurrent usage writes returned different values: %+v and %+v", first, r.usage)
+		}
+	}
+}
 
 // MetaStoreSuite runs a test suite on the metastore given a factory function.
 func MetaStoreSuite(t *testing.T, name string, meta func(root string) (*MetaStore, error)) {

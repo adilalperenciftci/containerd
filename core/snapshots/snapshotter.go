@@ -294,8 +294,8 @@ type Snapshotter interface {
 	// Usage returns the resource usage of an active or committed snapshot
 	// excluding the usage of parent snapshots.
 	//
-	// The running time of this call for active snapshots is dependent on
-	// implementation, but may be proportional to the size of the resource.
+	// The running time of this call is implementation dependent and may be
+	// proportional to the size of the resource.
 	// Callers should take this into consideration. Implementations should
 	// attempt to honor context cancellation and avoid taking locks when making
 	// the calculation.

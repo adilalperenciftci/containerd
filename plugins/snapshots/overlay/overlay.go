@@ -240,21 +240,23 @@ func (o *snapshotter) Update(ctx context.Context, info snapshots.Info, fieldpath
 // For active snapshots, this will scan the usage of the overlay "diff" (aka
 // "upper") directory and may take some time.
 //
-// For committed snapshots, the value is returned from the metadata database.
+// For committed snapshots, usage is calculated on the first request and then
+// returned from the metadata database.
 func (o *snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage, err error) {
 	var (
-		usage snapshots.Usage
-		info  snapshots.Info
-		id    string
+		usage    snapshots.Usage
+		info     snapshots.Info
+		id       string
+		recorded bool
 	)
 	if err := o.ms.WithTransaction(ctx, false, func(ctx context.Context) error {
-		id, info, usage, err = storage.GetInfo(ctx, key)
+		id, info, usage, recorded, err = storage.GetInfoWithUsage(ctx, key)
 		return err
 	}); err != nil {
 		return usage, err
 	}
 
-	if info.Kind == snapshots.KindActive {
+	if info.Kind == snapshots.KindActive || info.Kind == snapshots.KindCommitted && !recorded {
 		upperPath := o.upperPath(id)
 		du, err := fs.DiskUsage(ctx, upperPath)
 		if err != nil {
@@ -262,6 +264,15 @@ func (o *snapshotter) Usage(ctx context.Context, key string) (_ snapshots.Usage,
 			return snapshots.Usage{}, err
 		}
 		usage = snapshots.Usage(du)
+		if info.Kind == snapshots.KindCommitted {
+			err = o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
+				usage, err = storage.SetUsageIfAbsent(ctx, key, id, usage)
+				return err
+			})
+			if err != nil {
+				return snapshots.Usage{}, err
+			}
+		}
 	}
 	return usage, nil
 }
@@ -300,18 +311,19 @@ func (o *snapshotter) Mounts(ctx context.Context, key string) (_ []mount.Mount, 
 
 func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
 	return o.ms.WithTransaction(ctx, true, func(ctx context.Context) error {
-		// grab the existing id
 		id, _, _, err := storage.GetInfo(ctx, key)
 		if err != nil {
 			return err
 		}
-
-		usage, err := fs.DiskUsage(ctx, o.upperPath(id))
-		if err != nil {
+		if _, err := os.Lstat(o.upperPath(id)); err != nil {
 			return err
 		}
-
-		if _, err = storage.CommitActive(ctx, key, name, snapshots.Usage(usage), opts...); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Walking the upper directory here changes directory atime on mounts
+		// that track it, and delays Commit even when usage is never requested.
+		if _, err := storage.CommitActiveWithoutUsage(ctx, key, name, opts...); err != nil {
 			return fmt.Errorf("failed to commit snapshot %s: %w", key, err)
 		}
 		return nil

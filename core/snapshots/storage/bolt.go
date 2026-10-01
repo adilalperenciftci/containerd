@@ -76,22 +76,32 @@ func getParentPrefix(b []byte) uint64 {
 // GetInfo returns the snapshot Info directly from the metadata. Requires a
 // context with a storage transaction.
 func GetInfo(ctx context.Context, key string) (string, snapshots.Info, snapshots.Usage, error) {
+	id, info, usage, _, err := GetInfoWithUsage(ctx, key)
+	return id, info, usage, err
+}
+
+// GetInfoWithUsage also reports whether usage has been recorded for a snapshot.
+// A missing value can be used by snapshotters that calculate committed usage
+// on demand; a recorded zero usage remains distinguishable from a missing one.
+func GetInfoWithUsage(ctx context.Context, key string) (string, snapshots.Info, snapshots.Usage, bool, error) {
 	var (
-		id uint64
-		su snapshots.Usage
-		si = snapshots.Info{
+		id       uint64
+		su       snapshots.Usage
+		recorded bool
+		si       = snapshots.Info{
 			Name: key,
 		}
 	)
 	err := withSnapshotBucket(ctx, key, func(ctx context.Context, bkt, pbkt *bolt.Bucket) error {
+		recorded = bkt.Get(bucketKeyInodes) != nil && bkt.Get(bucketKeySize) != nil
 		getUsage(bkt, &su)
 		return readSnapshot(bkt, &id, &si)
 	})
 	if err != nil {
-		return "", snapshots.Info{}, snapshots.Usage{}, err
+		return "", snapshots.Info{}, snapshots.Usage{}, false, err
 	}
 
-	return strconv.FormatUint(id, 10), si, su, nil
+	return strconv.FormatUint(id, 10), si, su, recorded, nil
 }
 
 // UpdateInfo updates an existing snapshot info's data
@@ -348,6 +358,17 @@ func Remove(ctx context.Context, key string) (string, snapshots.Kind, error) {
 // is the same identifier of the original active snapshot. The provided context
 // must contain a writable transaction.
 func CommitActive(ctx context.Context, key, name string, usage snapshots.Usage, opts ...snapshots.Opt) (string, error) {
+	return commitActive(ctx, key, name, &usage, opts...)
+}
+
+// CommitActiveWithoutUsage commits an active snapshot without recording its
+// usage. GetInfo returns zero usage until the snapshotter calculates and
+// records it when requested.
+func CommitActiveWithoutUsage(ctx context.Context, key, name string, opts ...snapshots.Opt) (string, error) {
+	return commitActive(ctx, key, name, nil, opts...)
+}
+
+func commitActive(ctx context.Context, key, name string, usage *snapshots.Usage, opts ...snapshots.Opt) (string, error) {
 	var (
 		id   uint64
 		base snapshots.Info
@@ -399,8 +420,10 @@ func CommitActive(ctx context.Context, key, name string, usage snapshots.Usage, 
 		if err := putSnapshot(dbkt, id, si); err != nil {
 			return err
 		}
-		if err := putUsage(dbkt, usage); err != nil {
-			return err
+		if usage != nil {
+			if err := putUsage(dbkt, *usage); err != nil {
+				return err
+			}
 		}
 		if err := bkt.DeleteBucket([]byte(key)); err != nil {
 			return fmt.Errorf("failed to delete active snapshot %q: %w", key, err)
@@ -428,6 +451,28 @@ func CommitActive(ctx context.Context, key, name string, usage snapshots.Usage, 
 	}
 
 	return strconv.FormatUint(id, 10), nil
+}
+
+// SetUsageIfAbsent records usage for a committed snapshot, provided its ID
+// still matches. A concurrent calculation may have recorded the usage already;
+// in that case the stored value is returned instead.
+func SetUsageIfAbsent(ctx context.Context, key, expectedID string, usage snapshots.Usage) (snapshots.Usage, error) {
+	var stored snapshots.Usage
+	err := withSnapshotBucket(ctx, key, func(ctx context.Context, bkt, pbkt *bolt.Bucket) error {
+		if strconv.FormatUint(readID(bkt), 10) != expectedID || readKind(bkt) != snapshots.KindCommitted {
+			return fmt.Errorf("snapshot %q changed while calculating usage: %w", key, errdefs.ErrFailedPrecondition)
+		}
+		if bkt.Get(bucketKeyInodes) != nil && bkt.Get(bucketKeySize) != nil {
+			getUsage(bkt, &stored)
+			return nil
+		}
+		if err := putUsage(bkt, usage); err != nil {
+			return err
+		}
+		stored = usage
+		return nil
+	})
+	return stored, err
 }
 
 // IDMap returns all the IDs mapped to their key
